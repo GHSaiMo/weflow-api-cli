@@ -1,8 +1,14 @@
 /**
  * WeFlow API CLI - WebSocket 服务
- * 提供实时消息推送功能
+ * 提供实时消息推送功能（含消息内容解密）
+ * 
+ * 设计原则：
+ * 1. 只推送 new_message 类型的消息，不推送 db_change 和 session_update
+ * 2. 使用 localId 进行去重，避免重复推送相同消息
+ * 3. 实时监听数据库变更，通过命名管道 IPC 获取通知
  */
 import { WebSocketServer, WebSocket } from 'ws';
+import * as fzstd from 'fzstd';
 import { getConfig } from './config.js';
 import { getWcdbCore } from './wcdbCore.js';
 
@@ -10,6 +16,17 @@ interface WsClient {
     ws: WebSocket;
     id: string;
     subscribedSessions: Set<string>;
+}
+
+interface ProcessedMessage {
+    localId: number;
+    serverId: number;
+    localType: number;
+    createTime: number;
+    isSend: number;
+    senderUsername: string;
+    parsedContent: string;
+    rawContent: string;
 }
 
 export class WsService {
@@ -20,6 +37,18 @@ export class WsService {
     private clients: Map<string, WsClient> = new Map();
     private clientIdCounter = 0;
     private monitorStarted = false;
+
+    // 使用 localId 追踪每个会话已推送的消息，避免重复
+    // key: sessionId, value: Set of localIds that have been sent
+    private sentMessageIds: Map<string, Set<number>> = new Map();
+
+    // 每个会话保留的最大已发送消息 ID 数量（防止内存无限增长）
+    private readonly maxSentIdsPerSession = 1000;
+
+    // 防止频繁查询的节流
+    private pendingCheck = false;
+    private checkDebounceMs = 300;
+    private lastCheckTime = 0;
 
     constructor() {
         const config = getConfig();
@@ -219,6 +248,7 @@ export class WsService {
 
     private broadcast(data: any, sessionId?: string): void {
         const message = JSON.stringify(data);
+        let sentCount = 0;
 
         for (const client of this.clients.values()) {
             if (client.ws.readyState !== WebSocket.OPEN) continue;
@@ -227,11 +257,18 @@ export class WsService {
             if (sessionId) {
                 if (client.subscribedSessions.has(sessionId) || client.subscribedSessions.has('*')) {
                     client.ws.send(message);
+                    sentCount++;
                 }
             } else {
                 // 没有指定 sessionId，发送给所有客户端
                 client.ws.send(message);
+                sentCount++;
             }
+        }
+
+        // 调试：确认消息发送情况
+        if (data.type === 'new_message' && sessionId?.includes('@chatroom')) {
+            console.log(`[广播调试] 群聊消息已发送给 ${sentCount} 个客户端, sessionId=${sessionId}`);
         }
     }
 
@@ -262,43 +299,328 @@ export class WsService {
 
     private handleDbChange(type: string, json: string): void {
         try {
-            const data = JSON.parse(json);
-            const action = data.action || type;
-
-            // 解析变更信息
-            let sessionId: string | undefined;
-            let changeInfo: any = data;
-
-            // 根据不同的变更类型处理
-            if (data.talker || data.username || data.session_id) {
-                sessionId = data.talker || data.username || data.session_id;
-            }
-
-            // 构建推送消息
-            const notification = {
-                type: 'db_change',
-                action,
-                sessionId,
-                data: changeInfo,
-                timestamp: Date.now(),
-            };
-
-            // 广播给订阅的客户端
-            this.broadcast(notification, sessionId);
-
-            // 如果是新消息，额外发送一个 new_message 类型的通知
-            if (action === 'insert' || action === 'new_message') {
-                const messageNotification = {
-                    type: 'new_message',
-                    sessionId,
-                    data: changeInfo,
-                    timestamp: Date.now(),
-                };
-                this.broadcast(messageNotification, sessionId);
+            // 只要有数据库变更通知，并且有客户端订阅了，就检查新消息
+            if (this.hasSubscribedClients()) {
+                this.debouncedCheckNewMessages();
             }
         } catch (e) {
             console.error('处理数据库变更失败:', e);
         }
+    }
+
+    // 检查是否有客户端订阅了任何会话
+    private hasSubscribedClients(): boolean {
+        for (const client of this.clients.values()) {
+            if (client.subscribedSessions.size > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 获取所有订阅的会话（包括 * 通配符）
+    private getSubscribedSessionIds(): Set<string> {
+        const sessions = new Set<string>();
+        for (const client of this.clients.values()) {
+            for (const session of client.subscribedSessions) {
+                sessions.add(session);
+            }
+        }
+        return sessions;
+    }
+
+    // 防抖检查新消息
+    private debouncedCheckNewMessages(): void {
+        const now = Date.now();
+
+        // 如果距离上次检查时间太短，延迟执行
+        if (now - this.lastCheckTime < this.checkDebounceMs) {
+            if (!this.pendingCheck) {
+                this.pendingCheck = true;
+                setTimeout(() => {
+                    this.pendingCheck = false;
+                    this.checkNewMessages();
+                }, this.checkDebounceMs);
+            }
+            return;
+        }
+
+        this.lastCheckTime = now;
+        this.checkNewMessages();
+    }
+
+    // 检查并推送新消息
+    private async checkNewMessages(): Promise<void> {
+        try {
+            const wcdb = getWcdbCore();
+            const subscribedSessions = this.getSubscribedSessionIds();
+            const hasWildcard = subscribedSessions.has('*');
+
+            // 获取会话列表
+            const sessionsResult = await wcdb.getSessions();
+            if (!sessionsResult.success || !sessionsResult.data) {
+                return;
+            }
+
+            // 确定要检查的会话
+            let sessionsToCheck: any[] = sessionsResult.data;
+
+            if (!hasWildcard) {
+                // 只检查被订阅的会话
+                sessionsToCheck = sessionsToCheck.filter((session: any) => {
+                    const username = session.username || session.user_name || '';
+                    return subscribedSessions.has(username);
+                });
+            } else {
+                // 只检查前 20 个最近活跃的会话
+                sessionsToCheck = sessionsToCheck.slice(0, 20);
+            }
+
+            // 检查每个会话的最新消息
+            for (const session of sessionsToCheck) {
+                const username = session.username || session.user_name || '';
+                if (!username) continue;
+
+                await this.checkSessionNewMessages(username);
+            }
+        } catch (e) {
+            console.error('检查新消息失败:', e);
+        }
+    }
+
+    // 检查单个会话的新消息
+    private async checkSessionNewMessages(sessionId: string): Promise<void> {
+        try {
+            const wcdb = getWcdbCore();
+            const config = getConfig();
+            const myWxid = config.myWxid;
+
+            // 获取该会话已发送的消息 ID 集合
+            let sentIds = this.sentMessageIds.get(sessionId);
+            const isFirstCheck = !sentIds;
+            if (!sentIds) {
+                sentIds = new Set();
+                this.sentMessageIds.set(sessionId, sentIds);
+            }
+
+            // 查询最新的几条消息（降序，最新的在前）
+            const cursorResult = await wcdb.openMessageCursor(
+                sessionId,
+                10,      // 每次检查最新 10 条
+                false,   // descending - 最新的在前
+                0,       // no start time limit
+                0        // no end time limit
+            );
+
+            if (!cursorResult.success || !cursorResult.data) {
+                return;
+            }
+
+            const cursor = cursorResult.data;
+            const newMessages: ProcessedMessage[] = [];
+
+            try {
+                const batch = await wcdb.fetchMessageBatch(cursor);
+                if (batch.success && batch.data?.rows) {
+                    // 调试：针对群聊添加日志
+                    const isChatroom = sessionId.includes('@chatroom');
+                    if (isChatroom) {
+                        console.log(`[群聊调试] ${sessionId} 获取到 ${batch.data.rows.length} 条消息, isFirstCheck=${isFirstCheck}, sentIds.size=${sentIds.size}`);
+                    }
+
+                    for (const row of batch.data.rows) {
+                        const localId = parseInt(row.local_id || row.localId || '0', 10);
+
+                        // 首次检查：初始化已发送 ID，但不推送
+                        if (isFirstCheck) {
+                            sentIds.add(localId);
+                            continue;
+                        }
+
+                        // 检查是否已经发送过这条消息
+                        if (sentIds.has(localId)) {
+                            continue;
+                        }
+
+                        // 调试：群聊发现新消息
+                        if (isChatroom) {
+                            console.log(`[群聊调试] ${sessionId} 发现新消息 localId=${localId}`);
+                        }
+
+                        // 解码消息内容
+                        const content = this.decodeMessageContent(row.message_content, row.compress_content);
+                        const localType = parseInt(row.local_type || row.type || '1', 10);
+                        const createTime = parseInt(row.create_time || '0', 10);
+                        const senderUsername = row.sender_username || '';
+                        const isSend = parseInt(row.is_send || '0', 10) === 1;
+
+                        const parsedContent = this.parseMessageContent(content, localType);
+
+                        const message: ProcessedMessage = {
+                            localId,
+                            serverId: parseInt(row.server_id || '0', 10),
+                            localType,
+                            createTime,
+                            isSend: isSend ? 1 : 0,
+                            senderUsername: isSend ? myWxid : senderUsername || sessionId,
+                            parsedContent: parsedContent || `[类型 ${localType}]`,
+                            rawContent: content,
+                        };
+
+                        newMessages.push(message);
+
+                        // 标记为已发送
+                        sentIds.add(localId);
+                    }
+                }
+            } finally {
+                await wcdb.closeMessageCursor(cursor);
+            }
+
+            // 清理过多的已发送 ID（保持内存可控）
+            if (sentIds.size > this.maxSentIdsPerSession) {
+                const idsArray = Array.from(sentIds);
+                const toRemove = idsArray.slice(0, sentIds.size - this.maxSentIdsPerSession);
+                for (const id of toRemove) {
+                    sentIds.delete(id);
+                }
+            }
+
+            // 有新消息才广播
+            if (newMessages.length > 0) {
+                console.log(`[消息推送] ${sessionId} 推送 ${newMessages.length} 条新消息`);
+
+                // 按时间顺序发送（先发早的消息）
+                newMessages.reverse();
+
+                for (const msg of newMessages) {
+                    const notification = {
+                        type: 'new_message',
+                        sessionId,
+                        data: msg,
+                        timestamp: Date.now(),
+                    };
+                    this.broadcast(notification, sessionId);
+                }
+            }
+        } catch (e) {
+            console.error(`检查会话 ${sessionId} 新消息失败:`, e);
+        }
+    }
+
+    // 解码消息内容
+    private decodeMessageContent(messageContent: any, compressContent: any): string {
+        let content = '';
+
+        if (compressContent) {
+            content = this.decodeMaybeCompressed(compressContent);
+        }
+        if (!content && messageContent) {
+            content = this.decodeMaybeCompressed(messageContent);
+        }
+
+        return content;
+    }
+
+    private decodeMaybeCompressed(raw: any): string {
+        if (!raw) return '';
+        if (typeof raw === 'string') {
+            if (raw.length === 0) return '';
+
+            // 检查是否是 hex 编码
+            if (raw.length > 16 && /^[0-9a-fA-F]+$/.test(raw)) {
+                try {
+                    const bytes = Buffer.from(raw, 'hex');
+                    if (bytes.length > 0) return this.decodeBinaryContent(bytes);
+                } catch { }
+            }
+
+            // 检查是否是 base64 编码
+            if (raw.length > 16 && /^[A-Za-z0-9+/=]+$/.test(raw)) {
+                try {
+                    const bytes = Buffer.from(raw, 'base64');
+                    return this.decodeBinaryContent(bytes);
+                } catch {
+                    return raw;
+                }
+            }
+
+            return raw;
+        }
+        return '';
+    }
+
+    private decodeBinaryContent(data: Buffer): string {
+        if (data.length === 0) return '';
+        try {
+            // 检查是否是 zstd 压缩
+            if (data.length >= 4) {
+                const magic = data.readUInt32LE(0);
+                if (magic === 0xfd2fb528) {
+                    const decompressed = fzstd.decompress(data);
+                    return Buffer.from(decompressed).toString('utf-8');
+                }
+            }
+            // 直接尝试 UTF-8 解码
+            const decoded = data.toString('utf-8');
+            const replacementCount = (decoded.match(/\uFFFD/g) || []).length;
+            if (replacementCount < decoded.length * 0.2) {
+                return decoded.replace(/\uFFFD/g, '');
+            }
+            return data.toString('latin1');
+        } catch {
+            return '';
+        }
+    }
+
+    // 简化的消息内容解析
+    private parseMessageContent(content: string, localType: number): string | null {
+        if (!content) return null;
+
+        switch (localType) {
+            case 1: // 文本
+                return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)/, '').trim() || content;
+            case 3:
+                return '[图片]';
+            case 34:
+                return '[语音消息]';
+            case 42:
+                return '[名片]';
+            case 43:
+                return '[视频]';
+            case 47:
+                return '[动画表情]';
+            case 48:
+                return '[位置]';
+            case 49: {
+                const title = this.extractXmlValue(content, 'title');
+                const type = this.extractXmlValue(content, 'type');
+                if (type === '6') return title ? `[文件] ${title}` : '[文件]';
+                if (type === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]';
+                if (type === '33' || type === '36') return title ? `[小程序] ${title}` : '[小程序]';
+                if (type === '57') return title || '[引用消息]';
+                if (type === '2000') {
+                    const feedesc = this.extractXmlValue(content, 'feedesc');
+                    return feedesc ? `[转账] ${feedesc}` : '[转账]';
+                }
+                return title ? `[链接] ${title}` : '[链接]';
+            }
+            case 50:
+                return '[通话]';
+            case 10000:
+                return content.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() || '[系统消息]';
+            default:
+                return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)/, '').trim() || null;
+        }
+    }
+
+    private extractXmlValue(xml: string, tagName: string): string {
+        const regex = new RegExp(`<${tagName}>([\\s\\S]*?)</${tagName}>`, 'i');
+        const match = regex.exec(xml);
+        if (match) {
+            return match[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
+        }
+        return '';
     }
 
     // 手动触发消息推送（供外部调用）
@@ -307,17 +629,6 @@ export class WsService {
             type: 'new_message',
             sessionId,
             data: message,
-            timestamp: Date.now(),
-        };
-        this.broadcast(notification, sessionId);
-    }
-
-    // 手动触发会话更新推送
-    public pushSessionUpdate(sessionId: string, update: any): void {
-        const notification = {
-            type: 'session_update',
-            sessionId,
-            data: update,
             timestamp: Date.now(),
         };
         this.broadcast(notification, sessionId);
