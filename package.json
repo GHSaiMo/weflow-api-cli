@@ -1,0 +1,29 @@
+{
+    "name": "weflow-api-cli",
+    "version": "1.0.0",
+    "description": "WeFlow API CLI - 微信聊天记录 HTTP API 和 WebSocket 实时推送服务",
+    "main": "dist/index.js",
+    "type": "module",
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/index.js",
+        "dev": "tsx src/index.ts"
+    },
+    "dependencies": {
+        "better-sqlite3": "^12.5.0",
+        "dotenv": "^16.4.7",
+        "fzstd": "^0.1.1",
+        "koffi": "^2.9.0",
+        "ws": "^8.18.0"
+    },
+    "devDependencies": {
+        "@types/better-sqlite3": "^7.6.13",
+        "@types/node": "^22.10.10",
+        "@types/ws": "^8.5.14",
+        "tsx": "^4.19.2",
+        "typescript": "^5.6.3"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}
