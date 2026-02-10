@@ -52,6 +52,9 @@ export class WcdbCore {
 
     private monitorCallback: ((type: string, json: string) => void) | null = null;
     private monitorPipeClient: any = null;
+    private monitorReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    private monitorPipeConnected = false;
+    private monitorStopping = false;
 
     constructor() {
         const config = getConfig();
@@ -370,71 +373,197 @@ export class WcdbCore {
         }
     }
 
-    // Monitor 功能
+    // Monitor 功能 — 带重试和自动重连
     startMonitor(callback: (type: string, json: string) => void): boolean {
         if (!this.wcdbStartMonitorPipe) {
             this.writeLog('startMonitor: wcdbStartMonitorPipe not available');
             return false;
         }
 
-        try {
-            const result = this.wcdbStartMonitorPipe();
-            if (result !== 0) {
-                this.writeLog(`startMonitor: wcdbStartMonitorPipe failed with ${result}`);
-                return false;
+        this.monitorStopping = false;
+        this.monitorCallback = callback;
+
+        // 尝试启动管道服务，带重试
+        const started = this.tryStartPipeWithRetry();
+        if (started) {
+            this.writeLog('Monitor pipe server started, connecting client...');
+            this.connectMonitorPipe(0);
+            return true;
+        }
+
+        this.writeLog('startMonitor: pipe server failed after retries, will keep retrying in background');
+        // 即使首次失败也返回 true，后台持续重试
+        this.scheduleMonitorRetry();
+        return true;
+    }
+
+    /**
+     * 尝试启动 DLL 管道服务器，失败则先 stop 再重试（清理残留管道）
+     */
+    private tryStartPipeWithRetry(): boolean {
+        const MAX_RETRIES = 3;
+        const RETRY_DELAYS = [0, 200, 500]; // ms between retries
+
+        for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
+            // 在重试前先尝试停止，清理可能残留的管道
+            if (attempt > 0) {
+                this.writeLog(`startMonitor: retry attempt ${attempt + 1}/${MAX_RETRIES}, stopping old pipe first...`);
+                if (this.wcdbStopMonitorPipe) {
+                    try {
+                        this.wcdbStopMonitorPipe();
+                    } catch { }
+                }
+                // 同步等待一小段时间让系统释放管道资源
+                const waitUntil = Date.now() + RETRY_DELAYS[attempt];
+                while (Date.now() < waitUntil) { /* busy wait, short duration only */ }
             }
 
-            this.monitorCallback = callback;
+            try {
+                const result = this.wcdbStartMonitorPipe();
+                if (result === 0) {
+                    this.writeLog(`startMonitor: wcdb_start_monitor_pipe succeeded on attempt ${attempt + 1}`);
+                    return true;
+                }
+                this.writeLog(`startMonitor: wcdb_start_monitor_pipe returned ${result} on attempt ${attempt + 1}`);
+            } catch (e) {
+                this.writeLog(`startMonitor: wcdb_start_monitor_pipe threw on attempt ${attempt + 1}: ${e}`);
+            }
+        }
 
-            // 使用命名管道连接
+        return false;
+    }
+
+    /**
+     * 连接到命名管道客户端，带自动重连
+     */
+    private connectMonitorPipe(retryCount: number): void {
+        if (this.monitorStopping || !this.monitorCallback) return;
+
+        const MAX_CONNECT_RETRIES = 5;
+        const PIPE_PATH = '\\\\.\\pipe\\weflow_monitor';
+        // 首次连接等 200ms 让 DLL 管道服务器就绪，重试时递增延迟
+        const delay = retryCount === 0 ? 200 : Math.min(500 * retryCount, 5000);
+
+        this.monitorReconnectTimer = setTimeout(() => {
+            this.monitorReconnectTimer = null;
+            if (this.monitorStopping || !this.monitorCallback) return;
+
             import('net').then((net) => {
-                const PIPE_PATH = '\\\\.\\pipe\\weflow_monitor';
+                if (this.monitorStopping || !this.monitorCallback) return;
 
-                setTimeout(() => {
-                    this.monitorPipeClient = net.createConnection(PIPE_PATH, () => {
-                        this.writeLog('Monitor pipe connected');
-                    });
+                this.writeLog(`Monitor pipe connecting (attempt ${retryCount + 1})...`);
 
-                    let buffer = '';
-                    this.monitorPipeClient.on('data', (data: Buffer) => {
-                        buffer += data.toString('utf8');
-                        const lines = buffer.split('\n');
-                        buffer = lines.pop() || '';
+                const client = net.createConnection(PIPE_PATH, () => {
+                    this.writeLog('Monitor pipe connected');
+                    this.monitorPipeConnected = true;
+                });
 
-                        for (const line of lines) {
-                            if (line.trim() && this.monitorCallback) {
-                                try {
-                                    const parsed = JSON.parse(line);
-                                    this.monitorCallback(parsed.action || 'update', line);
-                                } catch {
-                                    this.monitorCallback('update', line);
-                                }
+                this.monitorPipeClient = client;
+
+                let buffer = '';
+                client.on('data', (data: Buffer) => {
+                    buffer += data.toString('utf8');
+                    const lines = buffer.split('\n');
+                    buffer = lines.pop() || '';
+
+                    for (const line of lines) {
+                        if (line.trim() && this.monitorCallback) {
+                            try {
+                                const parsed = JSON.parse(line);
+                                this.monitorCallback(parsed.action || 'update', line);
+                            } catch {
+                                this.monitorCallback('update', line);
                             }
                         }
-                    });
+                    }
+                });
 
-                    this.monitorPipeClient.on('error', (err: Error) => {
-                        this.writeLog(`Monitor pipe error: ${err.message}`);
-                    });
+                client.on('error', (err: Error) => {
+                    this.writeLog(`Monitor pipe error: ${err.message}`);
+                    this.monitorPipeConnected = false;
 
-                    this.monitorPipeClient.on('close', () => {
-                        this.writeLog('Monitor pipe closed');
-                        this.monitorPipeClient = null;
-                    });
-                }, 100);
+                    // 连接失败时自动重试
+                    if (!this.monitorStopping && this.monitorCallback) {
+                        if (retryCount < MAX_CONNECT_RETRIES) {
+                            this.writeLog(`Monitor pipe will reconnect (attempt ${retryCount + 2}/${MAX_CONNECT_RETRIES + 1})...`);
+                            this.connectMonitorPipe(retryCount + 1);
+                        } else {
+                            // 连接重试用尽，尝试重新启动整个管道
+                            this.writeLog('Monitor pipe connect retries exhausted, will restart pipe server...');
+                            this.scheduleMonitorRetry();
+                        }
+                    }
+                });
+
+                client.on('close', () => {
+                    this.writeLog('Monitor pipe closed');
+                    this.monitorPipeClient = null;
+                    this.monitorPipeConnected = false;
+
+                    // 非主动关闭时自动重连
+                    if (!this.monitorStopping && this.monitorCallback) {
+                        this.writeLog('Monitor pipe unexpectedly closed, will restart...');
+                        this.scheduleMonitorRetry();
+                    }
+                });
+            }).catch((e) => {
+                this.writeLog(`Monitor pipe import net failed: ${e}`);
             });
+        }, delay);
+    }
 
-            this.writeLog('Monitor started via named pipe IPC');
-            return true;
-        } catch (e) {
-            this.writeLog(`startMonitor failed: ${e}`);
-            return false;
+    /**
+     * 计划重新启动整个管道监控（stop → start → connect）
+     */
+    private scheduleMonitorRetry(): void {
+        if (this.monitorStopping || !this.monitorCallback) return;
+
+        // 清理现有连接
+        if (this.monitorPipeClient) {
+            try {
+                this.monitorPipeClient.destroy();
+            } catch { }
+            this.monitorPipeClient = null;
         }
+
+        // 3 秒后重试整个流程
+        this.monitorReconnectTimer = setTimeout(() => {
+            this.monitorReconnectTimer = null;
+            if (this.monitorStopping || !this.monitorCallback) return;
+
+            this.writeLog('Monitor: retrying full pipe startup...');
+            const started = this.tryStartPipeWithRetry();
+            if (started) {
+                this.connectMonitorPipe(0);
+            } else {
+                this.writeLog('Monitor: pipe restart failed, will notify callback to use fallback');
+                // 通知上层监控不可用，让 wsService 启用轮询备用方案
+                if (this.monitorCallback) {
+                    this.monitorCallback('monitor_unavailable', '{}');
+                }
+            }
+        }, 3000);
+    }
+
+    /** 检查管道监控是否活跃连接中 */
+    isMonitorConnected(): boolean {
+        return this.monitorPipeConnected && this.monitorPipeClient !== null;
     }
 
     stopMonitor(): void {
+        this.monitorStopping = true;
+        this.monitorPipeConnected = false;
+
+        // 清理重连定时器
+        if (this.monitorReconnectTimer) {
+            clearTimeout(this.monitorReconnectTimer);
+            this.monitorReconnectTimer = null;
+        }
+
         if (this.monitorPipeClient) {
-            this.monitorPipeClient.destroy();
+            try {
+                this.monitorPipeClient.destroy();
+            } catch { }
             this.monitorPipeClient = null;
         }
         if (this.wcdbStopMonitorPipe) {

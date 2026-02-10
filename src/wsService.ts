@@ -37,6 +37,9 @@ export class WsService {
     private clients: Map<string, WsClient> = new Map();
     private clientIdCounter = 0;
     private monitorStarted = false;
+    private pollingTimer: ReturnType<typeof setInterval> | null = null;
+    private pollingIntervalMs = 3000; // 轮询间隔（毫秒）
+    private usingFallbackPolling = false;
 
     // 使用 localId 追踪每个会话已推送的消息，避免重复
     // key: sessionId, value: Set of localIds that have been sent
@@ -265,11 +268,6 @@ export class WsService {
                 sentCount++;
             }
         }
-
-        // 调试：确认消息发送情况
-        if (data.type === 'new_message' && sessionId?.includes('@chatroom')) {
-            console.log(`[广播调试] 群聊消息已发送给 ${sentCount} 个客户端, sessionId=${sessionId}`);
-        }
     }
 
     private startDbMonitor(): void {
@@ -277,24 +275,72 @@ export class WsService {
 
         const wcdb = getWcdbCore();
         const success = wcdb.startMonitor((type, json) => {
+            if (type === 'monitor_unavailable') {
+                // 管道监控不可用，启用轮询备用方案
+                if (!this.usingFallbackPolling) {
+                    console.warn('⚠️ 管道监控不可用，切换到轮询模式检测新消息');
+                    this.startFallbackPolling();
+                }
+                return;
+            }
+
+            // 管道监控恢复后，停止轮询
+            if (this.usingFallbackPolling) {
+                console.log('✅ 管道监控已恢复，停止轮询模式');
+                this.stopFallbackPolling();
+            }
+
             this.handleDbChange(type, json);
         });
 
+        // startMonitor 现在总是返回 true（因为它会后台重试）
+        // 但我们仍然标记 monitorStarted
+        this.monitorStarted = true;
+
         if (success) {
-            this.monitorStarted = true;
             console.log('✅ 数据库变更监控已启动');
-        } else {
-            console.warn('⚠️ 数据库变更监控启动失败（可能不支持此功能）');
         }
+
+        // 如果管道监控在短时间内未建立连接，启动轮询作为备用
+        setTimeout(() => {
+            if (this.monitorStarted && !wcdb.isMonitorConnected() && !this.usingFallbackPolling) {
+                console.warn('⚠️ 管道监控未在预期时间内连接，启用轮询备用模式');
+                this.startFallbackPolling();
+            }
+        }, 5000);
     }
 
     private stopDbMonitor(): void {
         if (!this.monitorStarted) return;
 
+        this.stopFallbackPolling();
+
         const wcdb = getWcdbCore();
         wcdb.stopMonitor();
         this.monitorStarted = false;
         console.log('数据库变更监控已停止');
+    }
+
+    /** 启动轮询备用方案 */
+    private startFallbackPolling(): void {
+        if (this.pollingTimer) return;
+        this.usingFallbackPolling = true;
+
+        console.log(`📡 轮询模式已启动 (间隔: ${this.pollingIntervalMs}ms)`);
+        this.pollingTimer = setInterval(() => {
+            if (this.hasSubscribedClients()) {
+                this.checkNewMessages();
+            }
+        }, this.pollingIntervalMs);
+    }
+
+    /** 停止轮询备用方案 */
+    private stopFallbackPolling(): void {
+        if (this.pollingTimer) {
+            clearInterval(this.pollingTimer);
+            this.pollingTimer = null;
+        }
+        this.usingFallbackPolling = false;
     }
 
     private handleDbChange(type: string, json: string): void {
@@ -422,11 +468,6 @@ export class WsService {
             try {
                 const batch = await wcdb.fetchMessageBatch(cursor);
                 if (batch.success && batch.data?.rows) {
-                    // 调试：针对群聊添加日志
-                    const isChatroom = sessionId.includes('@chatroom');
-                    if (isChatroom) {
-                        console.log(`[群聊调试] ${sessionId} 获取到 ${batch.data.rows.length} 条消息, isFirstCheck=${isFirstCheck}, sentIds.size=${sentIds.size}`);
-                    }
 
                     for (const row of batch.data.rows) {
                         const localId = parseInt(row.local_id || row.localId || '0', 10);
@@ -442,10 +483,6 @@ export class WsService {
                             continue;
                         }
 
-                        // 调试：群聊发现新消息
-                        if (isChatroom) {
-                            console.log(`[群聊调试] ${sessionId} 发现新消息 localId=${localId}`);
-                        }
 
                         // 解码消息内容
                         const content = this.decodeMessageContent(row.message_content, row.compress_content);
