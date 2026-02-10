@@ -4,7 +4,9 @@
  * 基于原项目 electron/services/wcdbCore.ts 简化实现
  */
 import { join, dirname } from 'path';
-import { existsSync, mkdirSync, readdirSync, statSync, appendFileSync } from 'fs';
+import { existsSync, mkdirSync, readdirSync, statSync, appendFileSync, readFileSync, writeFileSync } from 'fs';
+import { execSync } from 'child_process';
+import { uptime } from 'os';
 import { getConfig } from './config.js';
 
 interface WcdbResult<T = any> {
@@ -24,6 +26,8 @@ export class WcdbCore {
     private currentPath: string | null = null;
     private currentKey: string | null = null;
     private currentWxid: string | null = null;
+    private opChain: Promise<void> = Promise.resolve();
+    private lastDllLogTime = 0;
 
     // DLL 函数引用
     private wcdbInit: any = null;
@@ -49,6 +53,7 @@ export class WcdbCore {
     private wcdbListMediaDbs: any = null;
     private wcdbStartMonitorPipe: any = null;
     private wcdbStopMonitorPipe: any = null;
+    private wcdbGetLogs: any = null;
 
     private monitorCallback: ((type: string, json: string) => void) | null = null;
     private monitorPipeClient: any = null;
@@ -73,6 +78,39 @@ export class WcdbCore {
             }
             appendFileSync(join(this.logDir, 'wcdb.log'), line + '\n', { encoding: 'utf8' });
         } catch { }
+    }
+
+    private runSerialized<T>(fn: () => Promise<T> | T): Promise<T> {
+        const run = this.opChain.then(() => fn());
+        this.opChain = run.then(
+            () => undefined,
+            () => undefined
+        );
+        return run;
+    }
+
+    private logDllDiagnostics(reason: string): void {
+        if (!this.wcdbGetLogs) return;
+        const now = Date.now();
+        if (now - this.lastDllLogTime < 5000) return;
+        this.lastDllLogTime = now;
+
+        try {
+            const outPtr = [null as any];
+            const result = this.wcdbGetLogs(outPtr);
+            if (result !== 0) {
+                this.writeLog(`wcdb_get_logs failed (${reason}): ${result}`, true);
+                return;
+            }
+            const jsonStr = this.decodeJsonPtr(outPtr[0]);
+            if (jsonStr) {
+                this.writeLog(`wcdb_get_logs (${reason}): ${jsonStr}`, true);
+            } else {
+                this.writeLog(`wcdb_get_logs (${reason}): empty`, true);
+            }
+        } catch (e) {
+            this.writeLog(`wcdb_get_logs threw (${reason}): ${e}`, true);
+        }
     }
 
     private getDllPath(): string {
@@ -165,6 +203,10 @@ export class WcdbCore {
     }
 
     async initialize(): Promise<boolean> {
+        return this.runSerialized(() => this.initializeInternal());
+    }
+
+    private async initializeInternal(): Promise<boolean> {
         if (this.initialized) return true;
 
         try {
@@ -239,6 +281,12 @@ export class WcdbCore {
                 this.wcdbGetGroupNicknames = null;
             }
 
+            try {
+                this.wcdbGetLogs = this.lib.func('int32 wcdb_get_logs(_Out_ void** outJson)');
+            } catch {
+                this.wcdbGetLogs = null;
+            }
+
             // Monitor pipe functions
             try {
                 this.wcdbStartMonitorPipe = this.lib.func('int32 wcdb_start_monitor_pipe()');
@@ -266,9 +314,10 @@ export class WcdbCore {
     }
 
     async open(dbPath: string, hexKey: string, wxid: string): Promise<boolean> {
+        return this.runSerialized(async () => {
         try {
             if (!this.initialized) {
-                const initOk = await this.initialize();
+                const initOk = await this.initializeInternal();
                 if (!initOk) return false;
             }
 
@@ -282,7 +331,7 @@ export class WcdbCore {
             }
 
             if (this.handle !== null) {
-                this.close();
+                this.closeInternal();
             }
 
             const dbStoragePath = this.resolveDbStoragePath(dbPath, wxid);
@@ -330,9 +379,10 @@ export class WcdbCore {
             this.writeLog(`打开数据库异常: ${e}`, true);
             return false;
         }
+        });
     }
 
-    close(): void {
+    private closeInternal(): void {
         if (this.handle !== null) {
             try {
                 this.wcdbCloseAccount(this.handle);
@@ -344,15 +394,23 @@ export class WcdbCore {
         }
     }
 
+    close(): void {
+        void this.runSerialized(() => {
+            this.closeInternal();
+        });
+    }
+
     shutdown(): void {
-        this.stopMonitor();
-        this.close();
-        if (this.wcdbShutdown) {
-            try {
-                this.wcdbShutdown();
-            } catch { }
-        }
-        this.initialized = false;
+        void this.runSerialized(() => {
+            this.stopMonitor();
+            this.closeInternal();
+            if (this.wcdbShutdown) {
+                try {
+                    this.wcdbShutdown();
+                } catch { }
+            }
+            this.initialized = false;
+        });
     }
 
     isConnected(): boolean {
@@ -383,6 +441,9 @@ export class WcdbCore {
         this.monitorStopping = false;
         this.monitorCallback = callback;
 
+        // 先强力清理残留管道和可能的僵尸进程
+        this.cleanupStalePipes();
+
         // 尝试启动管道服务，带重试
         const started = this.tryStartPipeWithRetry();
         if (started) {
@@ -398,21 +459,128 @@ export class WcdbCore {
     }
 
     /**
-     * 尝试启动 DLL 管道服务器，失败则先 stop 再重试（清理残留管道）
+     * 强力清理残留管道：
+     * 1. 先调 DLL stop 清理本进程内部状态
+     * 2. 检测 \\.\pipe\weflow_monitor 是否已存在
+     * 3. 如果存在，尝试杀掉持有管道的僵尸进程（上一次异常退出的 node/tsx）
+     * 4. 等待系统释放管道资源
+     */
+    private cleanupStalePipes(): void {
+        // Step 0: marker-based stale instance cleanup (same boot, previous PID)
+        try {
+            const currentPid = process.pid;
+            const bootTimeMs = Date.now() - Math.floor(uptime() * 1000);
+            const markerPath = join(this.logDir, 'instance.json');
+
+            if (existsSync(markerPath)) {
+                try {
+                    const raw = readFileSync(markerPath, { encoding: 'utf8' }).trim();
+                    if (raw) {
+                        const marker = JSON.parse(raw) as { pid?: number; bootTimeMs?: number };
+                        const sameBoot = typeof marker.bootTimeMs === 'number' && Math.abs(marker.bootTimeMs - bootTimeMs) < 5 * 60 * 1000;
+                        if (sameBoot && marker.pid && marker.pid !== currentPid) {
+                            try {
+                                execSync(`powershell -NoProfile -Command "Get-Process -Id ${marker.pid} -ErrorAction SilentlyContinue | Out-Null"`, { timeout: 2000, windowsHide: true });
+                                this.writeLog(`cleanupStalePipes: killing stale CLI PID from marker: ${marker.pid}`, true);
+                                execSync(`taskkill /PID ${marker.pid} /F`, { timeout: 3000, windowsHide: true });
+                            } catch {
+                                // process likely already gone
+                            }
+                        }
+                    }
+                } catch { }
+            }
+
+            if (!existsSync(this.logDir)) {
+                mkdirSync(this.logDir, { recursive: true });
+            }
+            writeFileSync(markerPath, JSON.stringify({ pid: currentPid, bootTimeMs }), { encoding: 'utf8' });
+        } catch (e) {
+            this.writeLog(`cleanupStalePipes: marker check failed (non-critical): ${e}`);
+        }
+
+        // 步骤1: 清理 DLL 内部状态（无论如何先调一次 stop）
+        if (this.wcdbStopMonitorPipe) {
+            try {
+                this.wcdbStopMonitorPipe();
+                this.writeLog('cleanupStalePipes: called wcdb_stop_monitor_pipe to clean DLL state');
+            } catch { }
+        }
+
+        // 步骤2: 检测管道是否被其他进程占用
+        try {
+            const currentPid = process.pid;
+
+            // 检查管道是否存在
+            let pipeExists = false;
+            try {
+                const check = execSync(
+                    'powershell -NoProfile -Command "Test-Path \\\\\\\\.\\\\pipe\\\\weflow_monitor"',
+                    { encoding: 'utf8', timeout: 3000, windowsHide: true }
+                ).trim();
+                pipeExists = check === 'True';
+            } catch { }
+
+            if (pipeExists) {
+                this.writeLog('cleanupStalePipes: stale pipe \\\\.\\.pipe\\weflow_monitor detected!', true);
+
+                // 步骤3: 查找并杀掉可能持有管道的僵尸进程（排除当前进程）
+                try {
+                    // 查找所有 node.exe 和 tsx 相关进程
+                    const psCommand = `powershell -NoProfile -Command "Get-Process -Name 'node','tsx' -ErrorAction SilentlyContinue | Where-Object { $_.Id -ne ${currentPid} } | Select-Object -ExpandProperty Id"`;
+                    const pidsStr = execSync(psCommand, { encoding: 'utf8', timeout: 3000, windowsHide: true }).trim();
+
+                    if (pidsStr) {
+                        const pids = pidsStr.split(/\r?\n/).map((s: string) => s.trim()).filter((s: string) => s);
+                        this.writeLog(`cleanupStalePipes: found ${pids.length} stale process(es): ${pids.join(', ')}`, true);
+
+                        for (const pid of pids) {
+                            try {
+                                execSync(`taskkill /PID ${pid} /F`, { timeout: 3000, windowsHide: true });
+                                this.writeLog(`cleanupStalePipes: killed stale process PID ${pid}`, true);
+                            } catch (e) {
+                                this.writeLog(`cleanupStalePipes: failed to kill PID ${pid}: ${e}`);
+                            }
+                        }
+
+                        // 等待系统释放管道资源
+                        const waitUntil = Date.now() + 1000;
+                        while (Date.now() < waitUntil) { /* busy wait for OS pipe cleanup */ }
+                        this.writeLog('cleanupStalePipes: waited 1s for OS pipe cleanup');
+                    } else {
+                        this.writeLog('cleanupStalePipes: pipe exists but no stale node/tsx processes found');
+                        // 管道存在但找不到进程，可能是其他原因，等待一下再试
+                        const waitUntil = Date.now() + 500;
+                        while (Date.now() < waitUntil) { /* brief wait */ }
+                    }
+                } catch (e) {
+                    this.writeLog(`cleanupStalePipes: process cleanup failed: ${e}`);
+                }
+            } else {
+                this.writeLog('cleanupStalePipes: no stale pipe detected, clean start');
+            }
+        } catch (e) {
+            this.writeLog(`cleanupStalePipes: check failed (non-critical): ${e}`);
+        }
+    }
+
+    /**
+     * 尝试启动 DLL 管道服务器，每次尝试前都先 stop 清理残留
      */
     private tryStartPipeWithRetry(): boolean {
         const MAX_RETRIES = 3;
         const RETRY_DELAYS = [0, 200, 500]; // ms between retries
 
         for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-            // 在重试前先尝试停止，清理可能残留的管道
+            // 每次都先调 stop 清理（包括第一次！之前只有 retry 才清理，是 bug 来源）
+            if (this.wcdbStopMonitorPipe) {
+                try {
+                    this.wcdbStopMonitorPipe();
+                } catch { }
+            }
+
             if (attempt > 0) {
-                this.writeLog(`startMonitor: retry attempt ${attempt + 1}/${MAX_RETRIES}, stopping old pipe first...`);
-                if (this.wcdbStopMonitorPipe) {
-                    try {
-                        this.wcdbStopMonitorPipe();
-                    } catch { }
-                }
+                this.writeLog(`startMonitor: retry attempt ${attempt + 1}/${MAX_RETRIES}, waiting ${RETRY_DELAYS[attempt]}ms...`);
                 // 同步等待一小段时间让系统释放管道资源
                 const waitUntil = Date.now() + RETRY_DELAYS[attempt];
                 while (Date.now() < waitUntil) { /* busy wait, short duration only */ }
@@ -430,6 +598,7 @@ export class WcdbCore {
             }
         }
 
+        this.logDllDiagnostics('startMonitor: wcdb_start_monitor_pipe failed after retries');
         return false;
     }
 
@@ -478,8 +647,10 @@ export class WcdbCore {
                     }
                 });
 
-                client.on('error', (err: Error) => {
-                    this.writeLog(`Monitor pipe error: ${err.message}`);
+                client.on('error', (err: NodeJS.ErrnoException) => {
+                    const code = err.code ? ` code=${err.code}` : '';
+                    const errno = typeof err.errno === 'number' ? ` errno=${err.errno}` : '';
+                    this.writeLog(`Monitor pipe error:${code}${errno} ${err.message}`);
                     this.monitorPipeConnected = false;
 
                     // 连接失败时自动重试
@@ -537,6 +708,7 @@ export class WcdbCore {
                 this.connectMonitorPipe(0);
             } else {
                 this.writeLog('Monitor: pipe restart failed, will notify callback to use fallback');
+                this.logDllDiagnostics('monitor: pipe restart failed');
                 // 通知上层监控不可用，让 wsService 启用轮询备用方案
                 if (this.monitorCallback) {
                     this.monitorCallback('monitor_unavailable', '{}');
@@ -577,6 +749,7 @@ export class WcdbCore {
     // ===== 数据库查询方法 =====
 
     async getSessions(): Promise<WcdbResult<any[]>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected()) {
             return { success: false, error: '数据库未连接' };
         }
@@ -599,9 +772,11 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 
     async getDisplayNames(usernames: string[]): Promise<WcdbResult<Record<string, string>>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected()) {
             return { success: false, error: '数据库未连接' };
         }
@@ -624,6 +799,7 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 
     async openMessageCursor(
@@ -633,6 +809,7 @@ export class WcdbCore {
         beginTimestamp: number,
         endTimestamp: number
     ): Promise<WcdbResult<number>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected()) {
             return { success: false, error: '数据库未连接' };
         }
@@ -657,9 +834,11 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 
     async fetchMessageBatch(cursor: number): Promise<WcdbResult<{ rows: any[]; hasMore: boolean }>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected()) {
             return { success: false, error: '数据库未连接' };
         }
@@ -683,9 +862,11 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 
     async closeMessageCursor(cursor: number): Promise<WcdbResult<void>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected()) {
             return { success: false, error: '数据库未连接' };
         }
@@ -696,9 +877,11 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 
     async getGroupNicknames(chatroomId: string): Promise<WcdbResult<Record<string, string>>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected() || !this.wcdbGetGroupNicknames) {
             return { success: false, error: '数据库未连接或功能不可用' };
         }
@@ -721,9 +904,11 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 
     async execQuery(kind: string, path: string | null, sql: string): Promise<WcdbResult<any[]>> {
+        return this.runSerialized(async () => {
         if (!this.isConnected()) {
             return { success: false, error: '数据库未连接' };
         }
@@ -746,6 +931,7 @@ export class WcdbCore {
         } catch (e) {
             return { success: false, error: String(e) };
         }
+        });
     }
 }
 

@@ -38,7 +38,7 @@ export class WsService {
     private clientIdCounter = 0;
     private monitorStarted = false;
     private pollingTimer: ReturnType<typeof setInterval> | null = null;
-    private pollingIntervalMs = 3000; // 轮询间隔（毫秒）
+    private pollingIntervalMs = 1000; // 轮询间隔（毫秒）— 降低以减少延迟
     private usingFallbackPolling = false;
 
     // 使用 localId 追踪每个会话已推送的消息，避免重复
@@ -50,7 +50,7 @@ export class WsService {
 
     // 防止频繁查询的节流
     private pendingCheck = false;
-    private checkDebounceMs = 300;
+    private checkDebounceMs = 100;  // 降低防抖时间以减少延迟
     private lastCheckTime = 0;
 
     constructor() {
@@ -307,7 +307,7 @@ export class WsService {
                 console.warn('⚠️ 管道监控未在预期时间内连接，启用轮询备用模式');
                 this.startFallbackPolling();
             }
-        }, 5000);
+        }, 2000);  // 降低超时以更快切换到轮询备用
     }
 
     private stopDbMonitor(): void {
@@ -345,8 +345,21 @@ export class WsService {
 
     private handleDbChange(type: string, json: string): void {
         try {
-            // 只要有数据库变更通知，并且有客户端订阅了，就检查新消息
-            if (this.hasSubscribedClients()) {
+            if (!this.hasSubscribedClients()) return;
+
+            // 尝试从管道消息中提取 sessionId，实现定向查询而非全量扫描
+            let targetSession: string | undefined;
+            try {
+                const parsed = JSON.parse(json);
+                targetSession = parsed.sessionId || parsed.username || parsed.talker || parsed.session_id || parsed.user_name;
+            } catch { }
+
+            if (targetSession) {
+                // 定向查询：只检查变化的那个会话，跳过防抖直接查
+                console.log(`[定向检查] 管道通知会话变更: ${targetSession}`);
+                this.checkSessionNewMessages(targetSession);
+            } else {
+                // 无法确定具体会话，回退到防抖全量检查
                 this.debouncedCheckNewMessages();
             }
         } catch (e) {
@@ -525,12 +538,12 @@ export class WsService {
 
             // 有新消息才广播
             if (newMessages.length > 0) {
-                console.log(`[消息推送] ${sessionId} 推送 ${newMessages.length} 条新消息`);
-
-                // 按时间顺序发送（先发早的消息）
                 newMessages.reverse();
 
                 for (const msg of newMessages) {
+                    const preview = this.truncateMessagePreview(msg.parsedContent || msg.rawContent || '', 20);
+                    console.log(`[消息推送] ${msg.senderUsername} 推送 1 条新消息 "${preview}"`);
+
                     const notification = {
                         type: 'new_message',
                         sessionId,
@@ -608,6 +621,12 @@ export class WsService {
         } catch {
             return '';
         }
+    }
+    private truncateMessagePreview(content: string, maxLength: number): string {
+        if (!content) return '';
+        const cleaned = content.replace(/\s+/g, ' ').trim();
+        if (cleaned.length <= maxLength) return cleaned;
+        return cleaned.slice(0, maxLength);
     }
 
     // 简化的消息内容解析
