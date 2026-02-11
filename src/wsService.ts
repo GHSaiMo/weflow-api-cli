@@ -541,8 +541,8 @@ export class WsService {
                 newMessages.reverse();
 
                 for (const msg of newMessages) {
-                    const preview = this.truncateMessagePreview(msg.parsedContent || msg.rawContent || '', 20);
-                    console.log(`[消息推送] ${msg.senderUsername} 推送 1 条新消息 "${preview}"`);
+                    const preview = this.truncateMessagePreview(msg.parsedContent || '', 20);
+                    console.log(`[\u65b0\u6d88\u606f] ${msg.senderUsername} \u63a8\u9001\u4e86 1 \u6761\u6d88\u606f ${preview}`);
 
                     const notification = {
                         type: 'new_message',
@@ -626,7 +626,7 @@ export class WsService {
         if (!content) return '';
         const cleaned = content.replace(/\s+/g, ' ').trim();
         if (cleaned.length <= maxLength) return cleaned;
-        return cleaned.slice(0, maxLength);
+        return `${cleaned.slice(0, maxLength)}\u2026`;
     }
 
     // 简化的消息内容解析

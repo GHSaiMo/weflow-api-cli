@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="WeFlow WebSocket 实时消息测试工具">
+    <title>WeFlow WebSocket Tester</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <div class="logo-icon">
+                        <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
+                            <circle cx="16" cy="16" r="14" stroke="url(#gradient)" stroke-width="2"/>
+                            <path d="M10 16L14 20L22 12" stroke="url(#gradient)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                            <defs>
+                                <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                                    <stop offset="0%" style="stop-color:#667eea"/>
+                                    <stop offset="100%" style="stop-color:#764ba2"/>
+                                </linearGradient>
+                            </defs>
+                        </svg>
+                    </div>
+                    <h1>WeFlow <span class="highlight">WebSocket</span> Tester</h1>
+                </div>
+                <div class="connection-status" id="connectionStatus">
+                    <span class="status-dot disconnected"></span>
+                    <span class="status-text">未连接</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <!-- Connection Panel -->
+            <section class="connection-panel glass-card">
+                <h2>🔌 连接设置</h2>
+                <div class="connection-form">
+                    <div class="input-group">
+                        <label for="wsUrl">WebSocket 地址</label>
+                        <input type="text" id="wsUrl" value="ws://127.0.0.1:5032" placeholder="ws://127.0.0.1:5032">
+                    </div>
+                    <div class="button-group">
+                        <button id="connectBtn" class="btn btn-primary">
+                            <span class="btn-icon">⚡</span>
+                            连接
+                        </button>
+                        <button id="disconnectBtn" class="btn btn-secondary" disabled>
+                            <span class="btn-icon">🔌</span>
+                            断开
+                        </button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Tabs -->
+            <div class="tabs-container glass-card">
+                <div class="tabs-header">
+                    <button class="tab-btn active" data-tab="all">
+                        <span class="tab-icon">📡</span>
+                        全部订阅
+                    </button>
+                    <button class="tab-btn" data-tab="specific">
+                        <span class="tab-icon">🎯</span>
+                        指定会话
+                    </button>
+                </div>
+
+                <!-- Tab: All Subscriptions -->
+                <div class="tab-content active" id="tab-all">
+                    <div class="subscription-controls">
+                        <button id="subscribeAllBtn" class="btn btn-accent" disabled>
+                            <span class="btn-icon">📢</span>
+                            订阅全部更新
+                        </button>
+                        <button id="unsubscribeAllBtn" class="btn btn-outline" disabled>
+                            <span class="btn-icon">🔕</span>
+                            取消订阅
+                        </button>
+                        <button id="clearAllMsgsBtn" class="btn btn-ghost">
+                            <span class="btn-icon">🗑️</span>
+                            清空消息
+                        </button>
+                    </div>
+                    <div class="messages-container">
+                        <div class="messages-header">
+                            <h3>📨 实时消息流</h3>
+                            <span class="message-count" id="allMsgCount">0 条消息</span>
+                        </div>
+                        <div class="messages-box" id="allMessages">
+                            <div class="empty-state">
+                                <div class="empty-icon">📭</div>
+                                <p>暂无消息，请先连接并订阅</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Tab: Specific Sessions -->
+                <div class="tab-content" id="tab-specific">
+                    <div class="subscription-controls">
+                        <div class="input-group inline">
+                            <input type="text" id="sessionIds" placeholder='输入会话ID，如: ["wxid_xxx", "wxid_yyy"]' disabled>
+                        </div>
+                        <button id="subscribeSessionBtn" class="btn btn-accent" disabled>
+                            <span class="btn-icon">🔔</span>
+                            订阅会话
+                        </button>
+                        <button id="unsubscribeSessionBtn" class="btn btn-outline" disabled>
+                            <span class="btn-icon">🔕</span>
+                            取消订阅
+                        </button>
+                        <button id="clearSessionMsgsBtn" class="btn btn-ghost">
+                            <span class="btn-icon">🗑️</span>
+                            清空消息
+                        </button>
+                    </div>
+                    <div class="subscribed-sessions" id="subscribedSessions">
+                        <!-- Subscribed session tags will appear here -->
+                    </div>
+                    <div class="messages-container">
+                        <div class="messages-header">
+                            <h3>📨 会话消息流</h3>
+                            <span class="message-count" id="sessionMsgCount">0 条消息</span>
+                        </div>
+                        <div class="messages-box" id="sessionMessages">
+                            <div class="empty-state">
+                                <div class="empty-icon">📭</div>
+                                <p>暂无消息，请先连接并订阅指定会话</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Status Panel -->
+            <section class="status-panel glass-card">
+                <h2>📊 连接状态</h2>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <span class="status-label">客户端ID</span>
+                        <span class="status-value" id="clientId">-</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">连接状态</span>
+                        <span class="status-value" id="wsState">未连接</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">订阅模式</span>
+                        <span class="status-value" id="subMode">-</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">接收消息数</span>
+                        <span class="status-value" id="msgCount">0</span>
+                    </div>
+                </div>
+                <div class="quick-actions">
+                    <button id="pingBtn" class="btn btn-small btn-outline" disabled>
+                        🏓 Ping
+                    </button>
+                    <button id="statusBtn" class="btn btn-small btn-outline" disabled>
+                        📋 获取状态
+                    </button>
+                </div>
+            </section>
+        </main>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <p>WeFlow WebSocket Tester v1.0 | 用于测试 <a href="https://github.com/GHSaiMo/weflow-api-cli" target="_blank">weflow-api-cli</a> WebSocket 连接</p>
+        </footer>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
