@@ -153,26 +153,65 @@ GET /api/v1/contacts?keyword=xxx&limit=100
 }
 ```
 
-2. **新消息通知**
+2. **订阅确认**
 ```json
 {
-  "type": "new_message",
-  "sessionId": "wxid_xxx",
-  "data": { ... },
+  "type": "subscribed",
+  "sessions": ["wxid_xxx", "xxx@chatroom"],
   "timestamp": 1234567890
 }
 ```
 
-3. **数据库变更通知**
+3. **取消订阅确认**
 ```json
 {
-  "type": "db_change",
-  "action": "insert",
-  "sessionId": "wxid_xxx",
-  "data": { ... },
+  "type": "unsubscribed",
+  "sessions": [],
   "timestamp": 1234567890
 }
 ```
+
+4. **新消息通知** (与 ChatLab 格式一致)
+```json
+{
+  "type": "new_message",
+  "sessionId": "50429588654@chatroom",
+  "message": {
+    "sender": "wxid_xxx",
+    "timestamp": 1771600187,
+    "type": 25,
+    "content": "消息内容",
+    "platformMessageId": "6983520519095609000"
+  },
+  "timestamp": 1234567890
+}
+```
+
+消息字段说明：
+- `sender`: 发送者微信ID
+- `timestamp`: 消息时间戳（秒）
+- `type`: 消息类型（ChatLab 标准类型）
+  - `0`: 文本
+  - `1`: 图片
+  - `2`: 语音
+  - `3`: 视频
+  - `4`: 文件
+  - `5`: 表情
+  - `7`: 链接
+  - `8`: 位置
+  - `20`: 红包
+  - `21`: 转账
+  - `22`: 拍一拍
+  - `23`: 通话
+  - `24`: 分享
+  - `25`: 引用
+  - `26`: 聊天记录
+  - `27`: 名片
+  - `80`: 系统消息
+  - `81`: 撤回消息
+  - `99`: 其他
+- `content`: 消息内容（已解析的纯文本）
+- `platformMessageId`: 平台消息ID
 
 ## 目录结构
 
