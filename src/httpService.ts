@@ -471,10 +471,13 @@ export class HttpService {
         content = content.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
 
         // 移除所有 XML 标签
-        return content
-            .replace(/<[^>]+>/g, '')
-            .replace(/\s+/g, ' ')
-            .trim() || '[系统消息]';
+        let cleaned = content.replace(/<[^>]+>/g, '');
+        
+        // 移除尾部的数字（如撤回消息后的时间戳）
+        cleaned = cleaned.replace(/\d+\s*$/, '');
+        
+        // 清理多余空白
+        return cleaned.replace(/\s+/g, ' ').trim() || '[系统消息]';
     }
 
     /**
@@ -532,7 +535,8 @@ export class HttpService {
     }
 
     private stripSenderPrefix(content: string): string | null {
-        const result = content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)/, '');
+        // 移除开头的空白字符（包括换行符），然后移除发送者前缀
+        const result = content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)\s*/, '').trim();
         return result || null;
     }
 
@@ -661,54 +665,73 @@ export class HttpService {
             }
         }
 
-        // 获取发送者显示名
-        const senderNamesResult = await wcdb.getDisplayNames(Array.from(senderSet));
-        const senderNames = senderNamesResult.success && senderNamesResult.data ? senderNamesResult.data : {};
+        // 构建成员列表 - 优先使用 getGroupMembers 获取准确的群成员信息
+        const memberMap = new Map<string, any>();
+        const allUsernames: string[] = [];
 
-        // 获取群昵称
-        let groupNicknamesMap = new Map<string, string>();
         if (isGroup) {
-            const result = await wcdb.getGroupNicknames(talkerId);
-            if (result.success && result.data) {
-                groupNicknamesMap = new Map(Object.entries(result.data));
+            // 尝试获取群成员列表
+            const groupMembersResult = await wcdb.getGroupMembers(talkerId);
+            if (groupMembersResult.success && groupMembersResult.data) {
+                // 收集所有群成员的 username
+                for (const member of groupMembersResult.data) {
+                    const username = member.username || member.userName || member.wxid || member.platformId;
+                    if (username) {
+                        allUsernames.push(username);
+                    }
+                }
+
+                // 获取所有群成员的显示名（包括不在消息发送者中的）
+                const displayNamesResult = await wcdb.getDisplayNames(allUsernames);
+                const displayNamesMap = displayNamesResult.success && displayNamesResult.data ? displayNamesResult.data : {};
+
+                // 获取群昵称
+                const groupNicknamesResult = await wcdb.getGroupNicknames(talkerId);
+                const groupNicknames = groupNicknamesResult.success && groupNicknamesResult.data ? groupNicknamesResult.data : {};
+
+                for (const member of groupMembersResult.data) {
+                    const username = member.username || member.userName || member.wxid || member.platformId;
+                    if (!username) continue;
+
+                    // 优先使用 getDisplayNames 获取的显示名
+                    const displayName = displayNamesMap[username] || member.displayName || member.nickname || member.remark || member.accountName || username;
+                    const groupNickname = groupNicknames[username] || groupNicknames[username.toLowerCase()] || member.groupNickname || '';
+                    const isSelf = this.isSelfSender(username, myWxid);
+
+                    memberMap.set(username, {
+                        platformId: username,
+                        accountName: (isSelf && !isGroup) ? '我' : displayName,
+                        groupNickname: groupNickname || undefined,
+                    });
+                }
             }
         }
 
-        // 构建成员列表
-        const memberMap = new Map<string, any>();
+        // 如果是群聊但没有获取到群成员，或者获取发送者显示名
+        const senderArray = Array.from(senderSet);
+        const senderNamesResult = await wcdb.getDisplayNames(senderArray);
+        const senderNames = senderNamesResult.success && senderNamesResult.data ? senderNamesResult.data : {};
+
+        // 对于没有在群成员中的发送者，也添加到 memberMap
         for (const msg of messages) {
             const sender = msg.senderUsername || '';
             if (sender && !memberMap.has(sender)) {
                 const displayName = senderNames[sender] || sender;
                 const isSelf = this.isSelfSender(sender, myWxid);
-                // 获取群昵称（尝试多种方式）
-                const groupNickname = isGroup
-                    ? (groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || '')
-                    : '';
                 // 群聊中不使用"我"，统一使用真实昵称
                 memberMap.set(sender, {
                     platformId: sender,
                     accountName: (isSelf && !isGroup) ? '我' : displayName,
-                    groupNickname: groupNickname || undefined,
                 });
             }
         }
 
-        // 转换消息
+        // 转换消息 - 不包含 accountName 和 groupNickname（这些信息已在 members 中）
         const chatLabMessages = messages.map((msg) => {
             const sender = msg.senderUsername || '';
-            const isSelf = msg.isSend === 1 || this.isSelfSender(sender, myWxid);
-            // 群聊中不使用"我"，统一使用真实昵称
-            const accountName = (isSelf && !isGroup) ? '我' : (senderNames[sender] || sender);
-            // 获取该发送者的群昵称
-            const groupNickname = isGroup
-                ? (groupNicknamesMap.get(sender) || groupNicknamesMap.get(sender.toLowerCase()) || '')
-                : '';
 
             return {
                 sender,
-                accountName,
-                groupNickname: groupNickname || undefined,
                 timestamp: msg.createTime,
                 type: this.mapMessageType(msg.localType, msg),
                 content: this.getMessageContent(msg),

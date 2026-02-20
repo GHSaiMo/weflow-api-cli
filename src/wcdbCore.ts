@@ -907,6 +907,36 @@ export class WcdbCore {
         });
     }
 
+    /**
+     * 获取群成员列表
+     */
+    async getGroupMembers(chatroomId: string): Promise<WcdbResult<any[]>> {
+        return this.runSerialized(async () => {
+        if (!this.isConnected() || !this.wcdbGetGroupMembers) {
+            return { success: false, error: '数据库未连接或功能不可用' };
+        }
+
+        try {
+            const outPtr = [null as any];
+            const result = this.wcdbGetGroupMembers(this.handle, chatroomId, outPtr);
+
+            if (result !== 0) {
+                return { success: false, error: `获取群成员失败: ${result}` };
+            }
+
+            const jsonStr = this.decodeJsonPtr(outPtr[0]);
+            if (!jsonStr) {
+                return { success: true, data: [] };
+            }
+
+            const members = JSON.parse(jsonStr);
+            return { success: true, data: members };
+        } catch (e) {
+            return { success: false, error: String(e) };
+        }
+        });
+    }
+
     async execQuery(kind: string, path: string | null, sql: string): Promise<WcdbResult<any[]>> {
         return this.runSerialized(async () => {
         if (!this.isConnected()) {

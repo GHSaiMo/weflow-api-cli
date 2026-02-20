@@ -635,7 +635,7 @@ export class WsService {
 
         switch (localType) {
             case 1: // 文本
-                return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)/, '').trim() || content;
+                return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)\s*/, '').trim() || content;
             case 3:
                 return '[图片]';
             case 34:
@@ -664,7 +664,11 @@ export class WsService {
             case 50:
                 return '[通话]';
             case 10000:
-                return content.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim() || '[系统消息]';
+                // 移除 XML 标签
+                let cleaned = content.replace(/<[^>]+>/g, '');
+                // 移除尾部的数字（如撤回消息后的时间戳）
+                cleaned = cleaned.replace(/\d+\s*$/, '');
+                return cleaned.replace(/\s+/g, ' ').trim() || '[系统消息]';
             default:
                 return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)/, '').trim() || null;
         }
