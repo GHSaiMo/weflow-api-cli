@@ -273,7 +273,6 @@ class WeFlowWSTester {
         msgEl.innerHTML = `
             <div class="message-time">${time}</div>
             <span class="message-type">${message.type}</span>
-            ${message.sessionId ? `<span class="message-type" style="margin-left: 4px; background: var(--accent-glow);">${message.sessionId}</span>` : ''}
             <div class="message-content">${this.formatMessageContent(message)}</div>
         `;
 
@@ -299,30 +298,8 @@ class WeFlowWSTester {
     }
 
     formatMessageContent(message) {
-        // Create a clean copy without timestamp for display
-        const displayMsg = { ...message };
-        delete displayMsg.timestamp;
-
-        // Format based on message type
-        switch (message.type) {
-            case 'connected':
-                return `🎉 ${message.message} (Client ID: ${message.clientId})`;
-            case 'subscribed':
-                return `✅ 已订阅: ${JSON.stringify(message.sessions)}`;
-            case 'unsubscribed':
-                return `🔕 已取消订阅: ${JSON.stringify(message.sessions)}`;
-            case 'pong':
-                return `🏓 Pong!`;
-            case 'status':
-                return `📊 连接数: ${message.totalClients}, 监控: ${message.monitorActive ? '运行中' : '未启动'}, 订阅: ${JSON.stringify(message.subscribedSessions)}`;
-            case 'error':
-                return `❌ ${message.error}`;
-            case 'new_message':
-            case 'db_change':
-                return this.escapeHtml(JSON.stringify(message.data, null, 2));
-            default:
-                return this.escapeHtml(JSON.stringify(displayMsg, null, 2));
-        }
+        // Display the complete original JSON message
+        return this.escapeHtml(JSON.stringify(message, null, 2));
     }
 
     escapeHtml(text) {

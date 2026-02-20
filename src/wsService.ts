@@ -18,6 +18,29 @@ interface WsClient {
     subscribedSessions: Set<string>;
 }
 
+// ChatLab 消息类型映射
+const ChatLabType = {
+    TEXT: 0,
+    IMAGE: 1,
+    VOICE: 2,
+    VIDEO: 3,
+    FILE: 4,
+    EMOJI: 5,
+    LINK: 7,
+    LOCATION: 8,
+    RED_PACKET: 20,
+    TRANSFER: 21,
+    POKE: 22,
+    CALL: 23,
+    SHARE: 24,
+    REPLY: 25,
+    FORWARD: 26,
+    CONTACT: 27,
+    SYSTEM: 80,
+    RECALL: 81,
+    OTHER: 99,
+} as const;
+
 interface ProcessedMessage {
     localId: number;
     serverId: number;
@@ -27,6 +50,7 @@ interface ProcessedMessage {
     senderUsername: string;
     parsedContent: string;
     rawContent: string;
+    xmlType?: string;
 }
 
 export class WsService {
@@ -504,6 +528,9 @@ export class WsService {
                         const senderUsername = row.sender_username || '';
                         const isSend = parseInt(row.is_send || '0', 10) === 1;
 
+                        // 提取 XML 中的 type
+                        const xmlType = this.extractXmlValue(content, 'type') || undefined;
+
                         const parsedContent = this.parseMessageContent(content, localType);
 
                         const message: ProcessedMessage = {
@@ -515,6 +542,7 @@ export class WsService {
                             senderUsername: isSend ? myWxid : senderUsername || sessionId,
                             parsedContent: parsedContent || `[类型 ${localType}]`,
                             rawContent: content,
+                            xmlType,
                         };
 
                         newMessages.push(message);
@@ -544,10 +572,19 @@ export class WsService {
                     const preview = this.truncateMessagePreview(msg.parsedContent || '', 20);
                     console.log(`[\u65b0\u6d88\u606f] ${msg.senderUsername} \u63a8\u9001\u4e86 1 \u6761\u6d88\u606f ${preview}`);
 
+                    // 使用 mapMessageType 转换消息类型
+                    const chatlabType = this.mapMessageType(msg.localType, msg.xmlType);
+
                     const notification = {
                         type: 'new_message',
                         sessionId,
-                        data: msg,
+                        message: {
+                            sender: msg.senderUsername,
+                            timestamp: msg.createTime,
+                            type: chatlabType,
+                            content: msg.parsedContent,
+                            platformMessageId: String(msg.serverId),
+                        },
                         timestamp: Date.now(),
                     };
                     this.broadcast(notification, sessionId);
@@ -629,13 +666,17 @@ export class WsService {
         return `${cleaned.slice(0, maxLength)}\u2026`;
     }
 
-    // 简化的消息内容解析
+    // 消息内容解析（与 HTTP 服务保持一致）
     private parseMessageContent(content: string, localType: number): string | null {
         if (!content) return null;
 
+        // 检查 XML 中的 type 标签
+        const xmlTypeMatch = /<type>(\d+)<\/type>/i.exec(content);
+        const xmlType = xmlTypeMatch ? xmlTypeMatch[1] : null;
+
         switch (localType) {
             case 1: // 文本
-                return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)\s*/, '').trim() || content;
+                return this.stripSenderPrefix(content);
             case 3:
                 return '[图片]';
             case 34:
@@ -651,27 +692,97 @@ export class WsService {
             case 49: {
                 const title = this.extractXmlValue(content, 'title');
                 const type = this.extractXmlValue(content, 'type');
+
+                // 转账消息特殊处理
+                if (type === '2000') {
+                    const feedesc = this.extractXmlValue(content, 'feedesc');
+                    const payMemo = this.extractXmlValue(content, 'pay_memo');
+                    if (feedesc) {
+                        return payMemo ? `[转账] ${feedesc} ${payMemo}` : `[转账] ${feedesc}`;
+                    }
+                    return '[转账]';
+                }
+
                 if (type === '6') return title ? `[文件] ${title}` : '[文件]';
                 if (type === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]';
                 if (type === '33' || type === '36') return title ? `[小程序] ${title}` : '[小程序]';
                 if (type === '57') return title || '[引用消息]';
-                if (type === '2000') {
-                    const feedesc = this.extractXmlValue(content, 'feedesc');
-                    return feedesc ? `[转账] ${feedesc}` : '[转账]';
-                }
+                if (type === '5' || type === '49') return title ? `[链接] ${title}` : '[链接]';
                 return title ? `[链接] ${title}` : '[链接]';
             }
             case 50:
                 return '[通话]';
             case 10000:
-                // 移除 XML 标签
-                let cleaned = content.replace(/<[^>]+>/g, '');
-                // 移除尾部的数字（如撤回消息后的时间戳）
-                cleaned = cleaned.replace(/\d+\s*$/, '');
-                return cleaned.replace(/\s+/g, ' ').trim() || '[系统消息]';
+                return this.cleanSystemMessage(content);
+            case 266287972401: // 拍一拍
+                return this.cleanSystemMessage(content);
+            case 244813135921: {
+                // 引用消息 - 提取 title
+                const title = this.extractXmlValue(content, 'title');
+                return title || '[引用消息]';
+            }
             default:
-                return content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)/, '').trim() || null;
+                // 对于未知的 localType，检查 XML type 来判断消息类型
+                if (xmlType) {
+                    const title = this.extractXmlValue(content, 'title');
+
+                    // 群公告消息（type 87）
+                    if (xmlType === '87') {
+                        const textAnnouncement = this.extractXmlValue(content, 'textannouncement');
+                        if (textAnnouncement) {
+                            return `[群公告] ${textAnnouncement}`;
+                        }
+                        return '[群公告]';
+                    }
+
+                    // 转账消息
+                    if (xmlType === '2000') {
+                        const feedesc = this.extractXmlValue(content, 'feedesc');
+                        const payMemo = this.extractXmlValue(content, 'pay_memo');
+                        if (feedesc) {
+                            return payMemo ? `[转账] ${feedesc} ${payMemo}` : `[转账] ${feedesc}`;
+                        }
+                        return '[转账]';
+                    }
+
+                    // 其他类型
+                    if (xmlType === '6') return title ? `[文件] ${title}` : '[文件]';
+                    if (xmlType === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]';
+                    if (xmlType === '33' || xmlType === '36') return title ? `[小程序] ${title}` : '[小程序]';
+                    if (xmlType === '57') return title || '[引用消息]';
+                    if (title) return title;
+                }
+
+                // 最后尝试提取文本内容
+                return this.stripSenderPrefix(content) || null;
         }
+    }
+
+    /**
+     * 清理系统消息
+     */
+    private cleanSystemMessage(content: string): string {
+        if (!content) return '[系统消息]';
+
+        // 处理 CDATA 内容
+        content = content.replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '');
+
+        // 移除所有 XML 标签
+        let cleaned = content.replace(/<[^>]+>/g, '');
+        
+        // 移除尾部的数字（如撤回消息后的时间戳）
+        cleaned = cleaned.replace(/\d+\s*$/, '');
+        
+        // 清理多余空白
+        return cleaned.replace(/\s+/g, ' ').trim() || '[系统消息]';
+    }
+
+    /**
+     * 移除发送者前缀
+     */
+    private stripSenderPrefix(content: string): string | null {
+        const result = content.replace(/^[\s]*([a-zA-Z0-9_-]+):(?!\/\/)\s*/, '').trim();
+        return result || null;
     }
 
     private extractXmlValue(xml: string, tagName: string): string {
@@ -683,12 +794,82 @@ export class WsService {
         return '';
     }
 
+    /**
+     * 映射 WeChat 消息类型到 ChatLab 类型
+     */
+    private mapMessageType(localType: number, xmlType?: string): number {
+        switch (localType) {
+            case 1: // 文本
+                return ChatLabType.TEXT;
+            case 3: // 图片
+                return ChatLabType.IMAGE;
+            case 34: // 语音
+                return ChatLabType.VOICE;
+            case 43: // 视频
+                return ChatLabType.VIDEO;
+            case 47: // 动画表情
+                return ChatLabType.EMOJI;
+            case 48: // 位置
+                return ChatLabType.LOCATION;
+            case 42: // 名片
+                return ChatLabType.CONTACT;
+            case 50: // 语音/视频通话
+                return ChatLabType.CALL;
+            case 10000: // 系统消息
+                return ChatLabType.SYSTEM;
+            case 49: // 复合消息
+                return this.mapType49(xmlType);
+            case 244813135921: // 引用消息
+                return ChatLabType.REPLY;
+            case 266287972401: // 拍一拍
+                return ChatLabType.POKE;
+            case 8594229559345: // 红包
+                return ChatLabType.RED_PACKET;
+            case 8589934592049: // 转账
+                return ChatLabType.TRANSFER;
+            default:
+                return ChatLabType.OTHER;
+        }
+    }
+
+    /**
+     * 映射 Type 49 子类型
+     */
+    private mapType49(xmlType?: string): number {
+        switch (xmlType) {
+            case '5': // 链接
+            case '49':
+                return ChatLabType.LINK;
+            case '6': // 文件
+                return ChatLabType.FILE;
+            case '19': // 聊天记录
+                return ChatLabType.FORWARD;
+            case '33': // 小程序
+            case '36':
+                return ChatLabType.SHARE;
+            case '57': // 引用消息
+                return ChatLabType.REPLY;
+            case '2000': // 转账
+                return ChatLabType.TRANSFER;
+            case '2001': // 红包
+                return ChatLabType.RED_PACKET;
+            default:
+                return ChatLabType.OTHER;
+        }
+    }
+
     // 手动触发消息推送（供外部调用）
     public pushMessage(sessionId: string, message: any): void {
         const notification = {
             type: 'new_message',
             sessionId,
-            data: message,
+            message: {
+                sender: message.sender,
+                timestamp: message.timestamp,
+                type: message.type,
+                content: message.content,
+                platformMessageId: message.platformMessageId,
+            },
             timestamp: Date.now(),
         };
         this.broadcast(notification, sessionId);
