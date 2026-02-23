@@ -41,7 +41,8 @@ interface Message {
     senderUsername: string;
     parsedContent: string;
     rawContent: string;
-    xmlType?: string; // XML 中的 <type> 标签值
+    xmlType?: string;
+    url?: string;
 }
 
 export class HttpService {
@@ -271,7 +272,8 @@ export class HttpService {
                     }
 
                     // 提取 XML 中的 type
-                    const xmlType = this.extractXmlValue(content, 'type') || undefined;
+                    const xmlType = this.extractMessageXmlType(content, localType) || undefined;
+                    const linkUrl = this.extractLinkUrl(content, localType) || undefined;
 
                     const parsedContent = this.parseMessageContent(content, localType);
 
@@ -289,6 +291,7 @@ export class HttpService {
                         parsedContent: parsedContent || `[类型 ${localType}]`,
                         rawContent: content,
                         xmlType,
+                        url: linkUrl,
                     };
 
                     rows.push(message);
@@ -374,8 +377,7 @@ export class HttpService {
         if (!content) return null;
 
         // 检查 XML 中的 type 标签
-        const xmlTypeMatch = /<type>(\d+)<\/type>/i.exec(content);
-        const xmlType = xmlTypeMatch ? xmlTypeMatch[1] : null;
+        const xmlType = this.extractMessageXmlType(content, localType) || null;
 
         switch (localType) {
             case 1: // 文本
@@ -393,8 +395,9 @@ export class HttpService {
             case 48:
                 return '[位置]';
             case 49: {
-                const title = this.extractXmlValue(content, 'title');
-                const type = this.extractXmlValue(content, 'type');
+                const appMsg = this.extractAppMessageInfo(content, localType);
+                const title = appMsg.title || this.extractXmlValue(content, 'title');
+                const type = appMsg.xmlType || this.extractXmlValue(content, 'type');
 
                 // 转账消息特殊处理
                 if (type === '2000') {
@@ -427,7 +430,8 @@ export class HttpService {
             default:
                 // 对于未知的 localType，检查 XML type 来判断消息类型
                 if (xmlType) {
-                    const title = this.extractXmlValue(content, 'title');
+                    const appMsg = this.extractAppMessageInfo(content, localType);
+                    const title = appMsg.title || this.extractXmlValue(content, 'title');
 
                     // 群公告消息（type 87）
                     if (xmlType === '87') {
@@ -453,6 +457,7 @@ export class HttpService {
                     if (xmlType === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]';
                     if (xmlType === '33' || xmlType === '36') return title ? `[小程序] ${title}` : '[小程序]';
                     if (xmlType === '57') return title || '[引用消息]';
+                    if (xmlType === '5' || xmlType === '49') return title ? `[链接] ${title}` : '[链接]';
                     if (title) return title;
                 }
 
@@ -546,6 +551,90 @@ export class HttpService {
         if (match) {
             return match[1].replace(/<!\[CDATA\[/g, '').replace(/\]\]>/g, '').trim();
         }
+        return '';
+    }
+
+    private normalizeAppMessageContent(content: string): string {
+        if (!content) return '';
+        if (content.includes('&lt;') && content.includes('&gt;')) {
+            return content
+                .replace(/&lt;/g, '<')
+                .replace(/&gt;/g, '>')
+                .replace(/&amp;/g, '&')
+                .replace(/&quot;/g, '"')
+                .replace(/&#39;/g, "'")
+                .replace(/&apos;/g, "'");
+        }
+        return content;
+    }
+
+    private isAppMessageContent(content: string): boolean {
+        if (!content) return false;
+        return (
+            content.includes('<appmsg') ||
+            content.includes('&lt;appmsg') ||
+            content.includes('<msg>') ||
+            content.includes('&lt;msg')
+        );
+    }
+
+    private extractAppMessageInfo(content: string, localType?: number): { xmlType?: string; title?: string; url?: string } {
+        if (!content) return {};
+        if (localType !== 49 && !this.isAppMessageContent(content)) return {};
+
+        const normalized = this.normalizeAppMessageContent(content);
+        const appMsgBodyMatch = /<appmsg\b[^>]*>([\s\S]*?)<\/appmsg>/i.exec(normalized);
+        const appMsgBody = appMsgBodyMatch ? appMsgBodyMatch[1] : normalized;
+
+        const xmlType = this.extractXmlValue(appMsgBody, 'type') || this.extractXmlValue(normalized, 'type') || undefined;
+        const title = this.extractXmlValue(appMsgBody, 'title') || this.extractXmlValue(appMsgBody, 'des') || undefined;
+        const rawUrl = this.extractXmlValue(appMsgBody, 'url') || this.extractXmlValue(normalized, 'url');
+        const url = this.normalizeLinkUrl(rawUrl) || undefined;
+
+        return { xmlType, title, url };
+    }
+
+    private extractMessageXmlType(content: string, localType?: number): string {
+        const appMsg = this.extractAppMessageInfo(content, localType);
+        return appMsg.xmlType || this.extractXmlValue(content, 'type');
+    }
+
+    private extractLinkUrl(content: string, localType?: number): string {
+        const appMsg = this.extractAppMessageInfo(content, localType);
+        if (!appMsg.url) return '';
+        if (!appMsg.xmlType || appMsg.xmlType === '5' || appMsg.xmlType === '49') return appMsg.url;
+        return '';
+    }
+
+    private normalizeLinkUrl(rawUrl: string): string {
+        const value = (rawUrl || '').trim();
+        if (!value) return '';
+
+        const parseHttpUrl = (candidate: string): string => {
+            try {
+                const parsed = new URL(candidate);
+                if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+                    return parsed.toString();
+                }
+            } catch {
+                return '';
+            }
+            return '';
+        };
+
+        if (value.startsWith('//')) {
+            return parseHttpUrl(`https:${value}`);
+        }
+
+        const direct = parseHttpUrl(value);
+        if (direct) return direct;
+
+        const hasScheme = /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(value);
+        const isDomainLike = /^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:[/:?#].*)?$/.test(value);
+        if (!hasScheme && isDomainLike) {
+            return parseHttpUrl(`https://${value}`);
+        }
+
         return '';
     }
 
@@ -729,12 +818,17 @@ export class HttpService {
         // 转换消息 - 不包含 accountName 和 groupNickname（这些信息已在 members 中）
         const chatLabMessages = messages.map((msg) => {
             const sender = msg.senderUsername || '';
+            const type = this.mapMessageType(msg.localType, msg);
+            const url = type === ChatLabType.LINK
+                ? (msg.url || this.extractLinkUrl(msg.rawContent, msg.localType) || undefined)
+                : undefined;
 
             return {
                 sender,
                 timestamp: msg.createTime,
-                type: this.mapMessageType(msg.localType, msg),
+                type,
                 content: this.getMessageContent(msg),
+                url,
                 platformMessageId: msg.serverId ? String(msg.serverId) : undefined,
             };
         });
@@ -791,6 +885,9 @@ export class HttpService {
             case 8589934592049: // 转账
                 return ChatLabType.TRANSFER;
             default:
+                if (msg.xmlType && this.isAppMessageContent(msg.rawContent)) {
+                    return this.mapType49(msg);
+                }
                 return ChatLabType.OTHER;
         }
     }
@@ -849,7 +946,11 @@ export class HttpService {
             case 48:
                 return '[位置]';
             case 49: {
-                const title = this.extractXmlValue(msg.rawContent, 'title');
+                const appMsg = this.extractAppMessageInfo(msg.rawContent, msg.localType);
+                const title = appMsg.title || this.extractXmlValue(msg.rawContent, 'title');
+                const xmlType = msg.xmlType || appMsg.xmlType;
+                if (xmlType === '5' || xmlType === '49') return title ? `[链接] ${title}` : '[链接]';
+                if (xmlType === '6') return title ? `[文件] ${title}` : '[文件]';
                 return title || '[消息]';
             }
             default:
