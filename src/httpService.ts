@@ -33,7 +33,7 @@ const ChatLabType = {
 
 interface Message {
     localId: number;
-    serverId: number;
+    serverId: string;
     localType: number;
     createTime: number;
     sortSeq: number;
@@ -43,6 +43,7 @@ interface Message {
     rawContent: string;
     xmlType?: string;
     url?: string;
+    referencedMessageId?: string;
 }
 
 export class HttpService {
@@ -274,15 +275,19 @@ export class HttpService {
                     // 提取 XML 中的 type
                     const xmlType = this.extractMessageXmlType(content, localType) || undefined;
                     const linkUrl = this.extractLinkUrl(content, localType) || undefined;
+                    const referencedMessageId = this.isReplyMessage(localType, xmlType)
+                        ? this.extractReferencedMessageId(content)
+                        : undefined;
 
                     const parsedContent = this.parseMessageContent(content, localType);
 
                     // 判断是否是自己发送的消息
                     const isSelfMessage = isSend || this.isSelfSender(senderUsername, myWxid);
 
+                    const serverId = row.server_id ?? row.serverId ?? '';
                     const message: Message = {
                         localId,
-                        serverId: parseInt(row.server_id || row.serverId || '0', 10),
+                        serverId: serverId ? String(serverId) : '',
                         localType,
                         createTime,
                         sortSeq: parseInt(row.sort_seq || row.sortSeq || row.sequence || String(createTime), 10),
@@ -292,6 +297,7 @@ export class HttpService {
                         rawContent: content,
                         xmlType,
                         url: linkUrl,
+                        referencedMessageId,
                     };
 
                     rows.push(message);
@@ -412,7 +418,7 @@ export class HttpService {
                 if (type === '6') return title ? `[文件] ${title}` : '[文件]';
                 if (type === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]';
                 if (type === '33' || type === '36') return title ? `[小程序] ${title}` : '[小程序]';
-                if (type === '57') return title || '[引用消息]';
+                if (type === '57') return this.formatReplyContent(title);
                 if (type === '5' || type === '49') return title ? `[链接] ${title}` : '[链接]';
                 return title ? `[链接] ${title}` : '[链接]';
             }
@@ -421,11 +427,11 @@ export class HttpService {
             case 10000:
                 return this.cleanSystemMessage(content);
             case 266287972401: // 拍一拍
-                return this.cleanSystemMessage(content);
+                return this.formatPokeMessage(content);
             case 244813135921: {
                 // 引用消息 - 提取 title
                 const title = this.extractXmlValue(content, 'title');
-                return title || '[引用消息]';
+                return this.formatReplyContent(title);
             }
             default:
                 // 对于未知的 localType，检查 XML type 来判断消息类型
@@ -456,7 +462,7 @@ export class HttpService {
                     if (xmlType === '6') return title ? `[文件] ${title}` : '[文件]';
                     if (xmlType === '19') return title ? `[聊天记录] ${title}` : '[聊天记录]';
                     if (xmlType === '33' || xmlType === '36') return title ? `[小程序] ${title}` : '[小程序]';
-                    if (xmlType === '57') return title || '[引用消息]';
+                    if (xmlType === '57') return this.formatReplyContent(title);
                     if (xmlType === '5' || xmlType === '49') return title ? `[链接] ${title}` : '[链接]';
                     if (title) return title;
                 }
@@ -482,12 +488,55 @@ export class HttpService {
         cleaned = cleaned.replace(/\d+\s*$/, '');
         
         // 清理多余空白
-        return cleaned.replace(/\s+/g, ' ').trim() || '[系统消息]';
+        cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+        cleaned = this.normalizeChineseQuotes(cleaned);
+        return cleaned || '[系统消息]';
+    }
+
+
+    private normalizeChineseQuotes(text: string): string {
+        if (!text || !text.includes('"')) return text;
+        let result = '';
+        let open = true;
+        for (const ch of text) {
+            if (ch === '"') {
+                result += open ? '\u201c' : '\u201d';
+                open = !open;
+            } else {
+                result += ch;
+            }
+        }
+        return result;
+    }
+
+    private formatReplyContent(title: string | null | undefined): string {
+        const value = (title || '').trim();
+        if (!value) return '[\u5f15\u7528]';
+        if (value.startsWith('[\u5f15\u7528]')) return value;
+        return `[\u5f15\u7528] ${value}`;
+    }
+
+    private formatPokeMessage(content: string): string {
+        const cleaned = this.cleanSystemMessage(content);
+        const names: string[] = [];
+        const regex = /["\u201c\u201d](.*?)["\u201c\u201d]/g;
+        let match: RegExpExecArray | null;
+        while ((match = regex.exec(cleaned)) && names.length < 2) {
+            const name = match[1].trim();
+            if (name) names.push(name);
+        }
+        if (names.length >= 2) {
+            return `\u201c${names[0]}\u201d \u62cd\u4e86\u62cd \u201c${names[1]}\u201d`;
+        }
+        return cleaned;
     }
 
     /**
-     * 解析通话消息
+     * ??????
      */
+
+
     private parseVoipMessage(content: string): string {
         try {
             if (!content) return '[通话]';
@@ -592,6 +641,42 @@ export class HttpService {
         const url = this.normalizeLinkUrl(rawUrl) || undefined;
 
         return { xmlType, title, url };
+    }
+
+
+    private extractReferencedMessageId(content: string): string | undefined {
+        if (!content) return undefined;
+
+        const normalized = this.normalizeAppMessageContent(content);
+        const blocks: string[] = [];
+
+        const referMatch = /<refermsg\b[^>]*>([\s\S]*?)<\/refermsg>/i.exec(normalized);
+        if (referMatch?.[1]) {
+            blocks.push(referMatch[1]);
+        }
+
+        const appMsgMatch = /<appmsg\b[^>]*>([\s\S]*?)<\/appmsg>/i.exec(normalized);
+        if (appMsgMatch?.[1]) {
+            blocks.push(appMsgMatch[1]);
+        }
+
+        blocks.push(normalized);
+
+        const tags = ['svrid', 'msgid', 'msgId', 'frommsgid', 'from_msgid', 'quoteid', 'refermsgid'];
+        for (const block of blocks) {
+            for (const tag of tags) {
+                const value = this.extractXmlValue(block, tag);
+                if (value && /^[0-9]+$/.test(value)) {
+                    return value;
+                }
+            }
+        }
+
+        return undefined;
+    }
+
+    private isReplyMessage(localType: number, xmlType?: string): boolean {
+        return localType === 244813135921 || xmlType === '57';
     }
 
     private extractMessageXmlType(content: string, localType?: number): string {
@@ -828,8 +913,9 @@ export class HttpService {
                 timestamp: msg.createTime,
                 type,
                 content: this.getMessageContent(msg),
+                referencedPlatformMessageId: type === ChatLabType.REPLY ? msg.referencedMessageId : undefined,
                 url,
-                platformMessageId: msg.serverId ? String(msg.serverId) : undefined,
+                platformMessageId: msg.serverId ? msg.serverId : undefined,
             };
         });
 
@@ -951,8 +1037,17 @@ export class HttpService {
                 const xmlType = msg.xmlType || appMsg.xmlType;
                 if (xmlType === '5' || xmlType === '49') return title ? `[链接] ${title}` : '[链接]';
                 if (xmlType === '6') return title ? `[文件] ${title}` : '[文件]';
+                if (xmlType === '57') return this.formatReplyContent(title);
                 return title || '[消息]';
             }
+            case 244813135921: {
+                const title = this.extractXmlValue(msg.rawContent, 'title');
+                return this.formatReplyContent(title);
+            }
+            case 266287972401:
+                return this.formatPokeMessage(msg.rawContent);
+            case 10000:
+                return this.cleanSystemMessage(msg.rawContent);
             default:
                 return msg.rawContent || null;
         }

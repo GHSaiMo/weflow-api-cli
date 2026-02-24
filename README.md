@@ -175,13 +175,14 @@ GET /api/v1/contacts?keyword=xxx&limit=100
 ```json
 {
   "type": "new_message",
-  "sessionId": "50429588654@chatroom",
+  "sessionId": "xxxx@chatroom",
   "message": {
     "sender": "wxid_xxx",
     "timestamp": 1771600187,
     "type": 25,
-    "content": "消息内容",
-    "platformMessageId": "6983520519095609000"
+    "content": "[引用] 消息内容",
+    "referencedPlatformMessageId": "1234567890123456780",
+    "platformMessageId": "1234567890123456789"
   },
   "timestamp": 1234567890
 }
@@ -211,7 +212,10 @@ GET /api/v1/contacts?keyword=xxx&limit=100
   - `81`: 撤回消息
   - `99`: 其他
 - `content`: 消息内容（已解析的纯文本）
+- `referencedPlatformMessageId`: 引用消息对应的原消息ID（仅 `type=25` 时存在）
 - `platformMessageId`: 平台消息ID
+
+`content` 输出示例（部分类型）：`type=22` 为 `“A” 拍了拍 “B”`，`type=80` 为 `“昵称” 撤回了一条消息`，`type=25` 为 `[引用] 原消息内容`。
 
 ## 目录结构
 
