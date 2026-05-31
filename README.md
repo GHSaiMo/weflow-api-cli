@@ -1,6 +1,6 @@
 # WeFlow API CLI
 
-微信聊天记录 HTTP API 和 WebSocket 实时推送服务。
+微信聊天记录 HTTP API 和 WebSocket 实时推送服务，支持 Windows 和 macOS。
 
 这是 [WeFlow](https://github.com/hicccc77/WeFlow) 项目的 CLI 版本，去除了所有 UI 前端，只保留后端 API 查询接口和 WebSocket 增量推送功能。
 
@@ -9,6 +9,7 @@
 - **HTTP API**: 提供 REST 接口查询会话、消息、联系人
 - **WebSocket**: 实时推送数据库变更和新消息通知
 - **ChatLab 格式**: 支持标准化的 ChatLab 格式输出
+- **双平台**: Windows 复用原 DLL 后端，macOS 使用本地解密 + SQLite 后端，并可选启用 macOS dylib 后端
 - **独立运行**: 可在终端直接运行，无需 Electron
 
 ## 快速开始
@@ -31,13 +32,22 @@ cp .env.example .env
 
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
-| `DB_PATH` | 微信数据目录路径 | `C:\Users\xxx\Documents\xwechat_files` |
+| `DB_PATH` | 微信数据目录路径 | Windows: `C:\Users\xxx\Documents\xwechat_files`；macOS: `/Users/xxx/Library/Containers/com.tencent.xWeChat/Data/Documents/xwechat_files` |
 | `DECRYPT_KEY` | 解密密钥（64位十六进制） | `abc123...` |
 | `MY_WXID` | 微信ID | `wxid_xxxxxx` |
 | `HTTP_PORT` | HTTP API 端口 | `5031` |
 | `HTTP_HOST` | HTTP 监听地址 | `127.0.0.1` |
 | `WS_PORT` | WebSocket 端口 | `5032` |
 | `WS_HOST` | WebSocket 监听地址 | `127.0.0.1` |
+
+macOS 可选配置：
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `DB_WATCH_EVENT_DEBOUNCE_MS` | 数据库文件变更事件防抖时间 | `30` |
+| `DB_SYNC_MIN_INTERVAL_MS` | 解密同步最小间隔 | `100` |
+| `WCDB_DLL_ENABLED` | 是否启用 macOS dylib 后端 | `false` |
+| `WCDB_RESOURCES_PATH` | macOS dylib 资源目录，启用 DLL 模式时必填 | 空 |
 
 ### 3. 运行
 
@@ -224,9 +234,12 @@ weflow-api-cli/
 ├── src/
 │   ├── index.ts        # 主入口
 │   ├── config.ts       # 配置服务
-│   ├── wcdbCore.ts     # WCDB 数据库服务
+│   ├── wcdbCore.ts     # WCDB 平台选择入口
 │   ├── httpService.ts  # HTTP API 服务
-│   └── wsService.ts    # WebSocket 服务
+│   ├── wsService.ts    # WebSocket 服务
+│   └── platform/
+│       ├── win/        # Windows DLL 后端
+│       └── mac/        # macOS 解密/SQLite 后端
 ├── resources/          # DLL 文件目录
 │   ├── wcdb_api.dll
 │   ├── WCDB.dll
@@ -241,10 +254,11 @@ weflow-api-cli/
 
 ## 注意事项
 
-1. 仅支持 Windows 系统
+1. 支持 Windows 和 macOS，其他系统会在启动时报错
 2. 需要 Node.js 18.0.0 或更高版本
 3. 需要微信 4.0 及以上版本的数据库
 4. API 默认仅监听本地地址 `127.0.0.1`，不对外网开放
+5. Windows 默认从 `resources/` 加载 `wcdb_api.dll`；macOS 默认不需要 DLL，启用 `WCDB_DLL_ENABLED=true` 时需要提供 `libwcdb_api.dylib` 和 `libWCDB.dylib`
 
 ## 使用示例
 

@@ -1,7 +1,7 @@
 {
     "name": "weflow-api-cli",
     "version": "1.0.0",
-    "description": "WeFlow API CLI - 微信聊天记录 HTTP API 和 WebSocket 实时推送服务",
+    "description": "WeFlow API CLI - 跨平台微信聊天记录 HTTP API 和 WebSocket 实时推送服务",
     "main": "dist/index.js",
     "type": "module",
     "scripts": {

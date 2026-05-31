@@ -21,6 +21,12 @@ export interface AppConfig {
     // WebSocket
     wsPort: number;
     wsHost: string;
+    wsPollingIntervalMs: number;
+    wsCheckDebounceMs: number;
+    wsMonitorConnectTimeoutMs: number;
+    wsWildcardRecentSessionLimit: number;
+    wsSessionProbeBatchSize: number;
+    wsDirectSessionCheckEnabled: boolean;
 
     // 日志
     logEnabled: boolean;
@@ -28,6 +34,22 @@ export interface AppConfig {
 
     // 资源路径
     resourcesPath: string;
+
+    // macOS 数据同步
+    dbWatchEventDebounceMs: number;
+    dbSyncMinIntervalMs: number;
+
+    // macOS DLL 模式
+    dllEnabled: boolean;
+    wcdbResourcesPath: string;
+}
+
+function parseIntWithMin(raw: string | undefined, fallback: number, min: number): number {
+    if (!raw) return fallback;
+    const parsed = parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || Number.isNaN(parsed)) return fallback;
+    if (parsed < min) return min;
+    return parsed;
 }
 
 export function loadConfig(): AppConfig {
@@ -49,9 +71,19 @@ export function loadConfig(): AppConfig {
         httpHost: process.env.HTTP_HOST || '127.0.0.1',
         wsPort: parseInt(process.env.WS_PORT || '5032', 10),
         wsHost: process.env.WS_HOST || '127.0.0.1',
+        wsPollingIntervalMs: parseIntWithMin(process.env.WS_POLLING_INTERVAL_MS, 300, 50),
+        wsCheckDebounceMs: parseIntWithMin(process.env.WS_CHECK_DEBOUNCE_MS, 20, 0),
+        wsMonitorConnectTimeoutMs: parseIntWithMin(process.env.WS_MONITOR_CONNECT_TIMEOUT_MS, 1200, 100),
+        wsWildcardRecentSessionLimit: parseIntWithMin(process.env.WS_WILDCARD_RECENT_SESSION_LIMIT, 20, 1),
+        wsSessionProbeBatchSize: parseIntWithMin(process.env.WS_SESSION_PROBE_BATCH_SIZE, 10, 1),
+        wsDirectSessionCheckEnabled: process.env.WS_DIRECT_SESSION_CHECK_ENABLED !== 'false',
         logEnabled: process.env.LOG_ENABLED === 'true',
         logDir: process.env.LOG_DIR || './logs',
         resourcesPath: process.env.RESOURCES_PATH || './resources',
+        dbWatchEventDebounceMs: parseIntWithMin(process.env.DB_WATCH_EVENT_DEBOUNCE_MS, 30, 0),
+        dbSyncMinIntervalMs: parseIntWithMin(process.env.DB_SYNC_MIN_INTERVAL_MS, 100, 0),
+        dllEnabled: process.env.WCDB_DLL_ENABLED === 'true',
+        wcdbResourcesPath: process.env.WCDB_RESOURCES_PATH || '',
     };
 }
 
